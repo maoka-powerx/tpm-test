@@ -1,0 +1,46 @@
+System Requirements Specification: Go TPM Smart Proxy Sidecar
+1. System & Environmental Context
+The application will be deployed on a highly constrained, highly secure edge environment.
+* Hardware Device: Phoenix Contact VL3 UPC 2440 EDGE.
+* Operating System: Linux Ubuntu Pro Desktop.
+* Security Hardware: Discrete TPM 2.0 (Infineon SLB9670). Exposed to the OS at /dev/tpmrm0.
+* External Network: Cellular LTE/5G. High latency, metered bandwidth, and subject to frequent disconnects. Connects to a private, on-premise infrastructure (no public cloud).
+* Local Network: Connects locally to an offline, air-gapped Plant Management System (PMS).
+* Container Orchestration: Deployed as a Podman Pod (or Docker Compose stack) using the Sidecar Pattern.
+* Peer Application: A NestJS Edge Management System (EMS) running in a sibling container sharing the same localhost network namespace.
+2. Architectural Role
+The Go application acts as the Cryptographic Engine and the Zero-Trust mTLS Proxy for the edge device.
+The NestJS app handles all complex business logic, message routing (CERT_RENEWAL_REQUEST), and cellular API communication with the central CA (Step-CA). The NestJS app must not have direct access to the TPM hardware or hold any private keys in its memory. The Go app bridges the gap between the physical hardware and the NestJS networking logic.
+3. Functional Requirements
+3.1. Hardware Key Management (via /dev/tpmrm0)
+* Direct Hardware Interfacing: The app must communicate directly with the TPM Resource Manager using the google/go-tpm-tools or google/go-tpm libraries. It must not rely on C-based PKCS#11 bridges.
+* Key Generation: Generate hardware-bound cryptographic key pairs (e.g., ECC NIST P-256) entirely inside the TPM silicon.
+* Key Isolation: Ensure the Private Key never leaves the TPM.
+* Certificate Signing Requests (CSR): Accept device identity metadata, generate a CSR, and use the TPM to cryptographically sign the CSR. Return the signed CSR string.
+3.2. Local IPC / API for NestJS
+* Internal Communication: Expose a minimal, unencrypted local API (HTTP over localhost or a Unix Domain Socket) strictly for the NestJS container to consume.
+* Endpoints Required:
+    * POST /generate-csr: Triggers the Go app to generate a new hardware key and return a signed CSR.
+    * (Optional) POST /sign-payload: Allows NestJS to ask the Go app to sign arbitrary data payloads using the TPM key.
+3.3. The mTLS Reverse Proxy
+* TLS Termination: Listen on the local network (e.g., port 443) for incoming wss:// (mTLS WebSocket) connections from the offline PMS.
+* Hardware-Backed Handshake: During the TLS handshake, utilize Go's crypto/tls package. Pass a custom crypto.Signer interface linked to the TPM so the hardware performs the private key decryption/signing.
+* Certificate Loading: Load the public X.509 certificate (issued by Step-CA and saved to the disk by NestJS) and serve it alongside the TPM hardware signer.
+* Traffic Forwarding: Once the mTLS tunnel is established and the PMS certificate is verified against the custom CA root, use httputil.ReverseProxy to transparently forward the decrypted, raw WebSocket traffic to the NestJS container (listening on ws://localhost:3000).
+4. Non-Functional & Security Requirements
+4.1. Security Posture
+* Minimal Attack Surface: The Go application must be statically compiled and deployed in a scratch or distroless Docker container. It must contain no shell, package managers, or OS utilities.
+* File System: The container file system must be mounted as read_only: true.
+* Privileges: The app should run with the minimum capabilities required to access the /dev/tpmrm0 character device (e.g., as the tss group user), dropping all root privileges.
+4.2. Cellular Resilience
+* Graceful Degradation: The proxy and TPM interface must not crash if the cellular network drops. It must gracefully reject or queue requests.
+* Network Backoff: Any external network calls (if added later) must utilize randomized jitter and exponential backoff to prevent DDoS-ing the on-premise server upon factory-wide power restorations.
+4.3. Observability & Telemetry
+* Metrics Integration: Expose standard RED metrics (Rate, Errors, Duration) on a /metrics endpoint (Prometheus format).
+* OpenTelemetry: Output must be consumable by a local OpenTelemetry Collector sidecar.
+* Logging constraints: Log strictly in structured JSON. Drop all INFO/DEBUG logs in production to save cellular bandwidth; only emit ERROR or FATAL logs for the OTel Collector to ship back to the central Loki server.
+5. Recommended Go Packages
+* TPM Interface: github.com/google/go-tpm and github.com/google/go-tpm-tools
+* Reverse Proxy: net/http/httputil (Standard Library)
+* TLS & Crypto: crypto/tls, crypto/x509 (Standard Library)
+* Metrics: github.com/prometheus/client_golang/prometheus

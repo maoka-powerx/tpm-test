@@ -1,0 +1,61 @@
+Receives CERT_RENEWAL_REQUEST JSON envelopes from the offline PMS via the WebSocket.
+
+Forwards those requests over the cellular network to Step-CA.
+
+Saves the resulting .crt public certificates to a shared disk volume (e.g., /shared/certs/).
+
+Tells the Go app when to generate a new key/CSR via a local internal API.
+
+Component B: The Go Sidecar (To Be Built)
+
+Role: Hardware Cryptographic Engine & mTLS Reverse Proxy.
+
+Network (External facing): Listens on wss://0.0.0.0:443 for the offline PMS.
+
+Network (Internal facing): Proxies traffic to ws://localhost:3000 (NestJS). Exposes a local HTTP API on localhost:8080 for NestJS to trigger TPM actions.
+
+Duties:
+
+Talks directly to /dev/tpmrm0 (using github.com/google/go-tpm-tools or google/go-tpm).
+
+Generates ECC P-256 private keys physically inside the TPM (no AuthValue/PIN required, headless boot).
+
+Generates and signs Certificate Signing Requests (CSRs) using the TPM.
+
+Acts as an mTLS reverse proxy. It terminates the mTLS connection from the PMS using the hardware TPM as the crypto.Signer, verifies the PMS's client certificate against a custom CA root, and proxies the raw WebSocket frames to NestJS.
+
+3. Step-by-Step Workflows
+Workflow 1: Provisioning (Key & CSR Generation)
+
+NestJS makes a local HTTP call to the Go Sidecar: POST http://localhost:8080/api/v1/generate-csr with a JSON body containing the device identity (e.g., { "commonName": "vl3-edge-01" }).
+
+Go App asks the TPM to generate a new primary key and creates a CSR signed by that hardware key.
+
+Go App returns the raw CSR string to NestJS.
+
+NestJS sends the CSR to Step-CA over cellular.
+
+Step-CA returns the signed ems.crt. NestJS saves it to the shared volume /shared/certs/ems.crt.
+
+NestJS notifies the Go sidecar to reload its TLS configuration.
+
+Workflow 2: The mTLS Proxy (Steady State)
+
+Go App loads ems.crt from disk and links it to the TPM hardware signer.
+
+The offline PMS connects to wss://<edge-device-ip>:443.
+
+Go App performs the mTLS handshake. It validates the PMS client certificate and uses the TPM to prove its own identity.
+
+Once connected, Go App uses httputil.ReverseProxy to forward all WebSocket traffic to NestJS at ws://localhost:3000.
+
+4. Security & Design Requirements
+No CGO/PKCS#11: Do not use tpm2-pkcs11 or C-bindings. Use native Go libraries to interact with the TPM.
+
+Distroless/Scratch: The Go app must be designed to compile into a static binary that runs in a scratch container.
+
+Headless Operation: The TPM keys should not be locked behind a manual password (AuthValue), as the device must recover automatically from power outages.
+
+LLM Prompt Instruction:
+(Add this to the bottom when talking to the LLM)
+"Based on the System Context above, please act as a Senior Cloud-Native Security Engineer. Write the Go application for Component B. Start by defining the main.go structure, the internal HTTP server for NestJS (Workflow 1), and the mTLS httputil.ReverseProxy (Workflow 2) using github.com/google/go-tpm-tools."
